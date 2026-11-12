@@ -796,10 +796,8 @@ fn parse_xlsx_worksheet(
                         current_row[target_col] = resolved;
                     }
                 }
-                b"row" => {
-                    if rows.len() < max_rows && current_row.iter().any(|c| !c.is_empty()) {
-                        rows.push(current_row.clone());
-                    }
+                b"row" if rows.len() < max_rows && current_row.iter().any(|c| !c.is_empty()) => {
+                    rows.push(current_row.clone());
                 }
                 _ => {}
             },

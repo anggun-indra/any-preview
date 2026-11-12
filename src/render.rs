@@ -2857,11 +2857,7 @@ pub fn render_docx_document(
     let mut page_pngs = Vec::new();
     let mut thumb_png: Option<Vec<u8>> = None;
 
-    for (idx, (svg, texts)) in page_svgs
-        .into_iter()
-        .zip(page_texts.into_iter())
-        .enumerate()
-    {
+    for (idx, (svg, texts)) in page_svgs.into_iter().zip(page_texts).enumerate() {
         let heading = texts.first().map(|h| {
             if h.chars().count() > 46 {
                 let s: String = h.chars().take(46).collect();
