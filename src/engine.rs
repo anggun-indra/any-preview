@@ -15,16 +15,17 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 use zip::ZipArchive;
 
-/// Compact thumbnail representation rendered inside a chat message bubble
-/// or the pre-send confirmation dialog.
+/// Maximum input size accepted by either preview function (64 MiB).
+pub const MAX_INPUT_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Compact data returned for a file thumbnail.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreviewThumbnail {
-    /// "pdf", "spreadsheet", "document", "presentation", "archive", "code", "text", "image", "unknown"
-    pub kind: String,
-    /// Optional encoded image data. Rendered previews are typically PNG; original image
-    /// attachments retain their source encoding.
-    pub image_bytes: Option<Vec<u8>>,
-    /// Human-readable metadata summary (e.g., "3 Halaman • PDF", "2 Sheet • 120 Baris").
+    /// Detected file category.
+    pub kind: PreviewKind,
+    /// Optional thumbnail image and its media type.
+    pub image: Option<PreviewImage>,
+    /// Human-readable summary in English.
     pub summary: String,
     /// Optional text snippet or excerpt (e.g., opening paragraph of DOCX, slide 1 text, code lines).
     pub text_snippet: Option<String>,
@@ -37,35 +38,89 @@ pub struct PreviewThumbnail {
 /// A single spreadsheet tab for full preview.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreviewSheet {
+    /// Worksheet name.
     pub name: String,
+    /// First row used as column headings.
     pub headers: Vec<String>,
+    /// Preview rows after the header.
     pub rows: Vec<Vec<String>>,
+    /// Total number of data rows when available.
     pub total_rows: u32,
 }
 
 /// A single archive entry for ZIP/package inspection.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArchiveEntry {
+    /// Path inside the archive.
     pub path: String,
+    /// Uncompressed entry size.
     pub size_bytes: u64,
+    /// Whether this entry is a directory.
     pub is_dir: bool,
 }
 
 /// A logical document section or presentation slide.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreviewSection {
+    /// Section or slide title.
     pub title: String,
+    /// Extracted section or slide text.
     pub body: String,
 }
 
-/// Full interactive preview payload displayed when the user clicks a document.
+/// Encoded image bytes with the media type required to decode them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreviewImage {
+    /// Encoded image data.
+    pub bytes: Vec<u8>,
+    /// Image MIME type, such as `image/png` or `image/jpeg`.
+    pub mime_type: String,
+}
+
+impl PreviewImage {
+    fn from_encoded_bytes(bytes: Vec<u8>, fallback_mime_type: Option<&str>) -> Self {
+        let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            "image/jpeg"
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            "image/gif"
+        } else if bytes.starts_with(b"BM") {
+            "image/bmp"
+        } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            "image/webp"
+        } else {
+            fallback_mime_type
+                .filter(|value| value.starts_with("image/"))
+                .unwrap_or("application/octet-stream")
+        };
+
+        Self {
+            bytes,
+            mime_type: mime_type.to_string(),
+        }
+    }
+
+    fn from_png(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            mime_type: "image/png".to_string(),
+        }
+    }
+}
+
+/// Full preview data for a file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DocumentPreview {
-    pub kind: String,
+    /// Detected file category.
+    pub kind: PreviewKind,
+    /// Original file name supplied by the caller.
     pub filename: String,
+    /// Human-readable summary in English.
     pub summary: String,
-    /// Rasterized page images (PNG/JPEG) for PDF pages or embedded document/slide media.
-    pub page_images: Vec<Vec<u8>>,
+    /// Page or slide images with their media types.
+    pub page_images: Vec<PreviewImage>,
+    /// Number of pages, slides, or preview units returned.
     pub total_pages: u32,
     /// Spreadsheet tabs (XLSX, CSV, TSV).
     pub sheets: Vec<PreviewSheet>,
@@ -75,6 +130,48 @@ pub struct DocumentPreview {
     pub raw_text: Option<String>,
     /// Archive directory listing (ZIP, JAR, APK, EPUB).
     pub archive_entries: Vec<ArchiveEntry>,
+}
+
+/// Broad category detected for an input file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PreviewKind {
+    /// PDF file.
+    Pdf,
+    /// Spreadsheet or delimited table.
+    Spreadsheet,
+    /// Word processing document.
+    Document,
+    /// Slide presentation.
+    Presentation,
+    /// Compressed archive or package.
+    Archive,
+    /// Source code.
+    Code,
+    /// Plain text.
+    Text,
+    /// Raster image.
+    Image,
+    /// Unsupported, invalid, or oversized input.
+    Unknown,
+}
+
+impl PreviewKind {
+    /// Returns the stable lowercase identifier for this category.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Spreadsheet => "spreadsheet",
+            Self::Document => "document",
+            Self::Presentation => "presentation",
+            Self::Archive => "archive",
+            Self::Code => "code",
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,10 +194,8 @@ fn detect_format(filename: &str, mime_type: &str, data: &[u8]) -> DocFormat {
     if ext == "pdf" || mime_type == "application/pdf" || data.starts_with(b"%PDF-") {
         return DocFormat::Pdf;
     }
-    if matches!(
-        ext,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-    ) || mime_type.starts_with("image/")
+    if matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+        || mime_type.starts_with("image/")
     {
         return DocFormat::Image;
     }
@@ -116,7 +211,10 @@ fn detect_format(filename: &str, mime_type: &str, data: &[u8]) -> DocFormat {
     {
         return DocFormat::Spreadsheet;
     }
-    if matches!(ext, "csv" | "tsv") || mime_type == "text/csv" || mime_type == "text/tab-separated-values" {
+    if matches!(ext, "csv" | "tsv")
+        || mime_type == "text/csv"
+        || mime_type == "text/tab-separated-values"
+    {
         return DocFormat::Csv;
     }
     if matches!(ext, "pptx" | "pptm" | "odp" | "key")
@@ -210,7 +308,21 @@ fn inspect_zip_flavor(data: &[u8]) -> DocFormat {
 }
 
 /// Generate a compact thumbnail for an attachment or confirmation dialog.
+///
+/// Unsupported, invalid, or oversized inputs return a thumbnail with
+/// [`PreviewKind::Unknown`].
 pub fn generate_thumbnail(filename: &str, mime_type: &str, data: &[u8]) -> PreviewThumbnail {
+    if data.len() > MAX_INPUT_SIZE_BYTES {
+        return PreviewThumbnail {
+            kind: PreviewKind::Unknown,
+            image: None,
+            summary: "File exceeds the 64 MiB preview limit".to_string(),
+            text_snippet: None,
+            table_preview: Vec::new(),
+            item_count: None,
+        };
+    }
+
     match detect_format(filename, mime_type, data) {
         DocFormat::Pdf => generate_pdf_thumbnail(data),
         DocFormat::Word => generate_word_thumbnail(data),
@@ -220,16 +332,19 @@ pub fn generate_thumbnail(filename: &str, mime_type: &str, data: &[u8]) -> Previ
         DocFormat::Archive => generate_archive_thumbnail(data),
         DocFormat::CodeOrText => generate_text_thumbnail(filename, data),
         DocFormat::Image => PreviewThumbnail {
-            kind: "image".to_string(),
-            image_bytes: Some(data.to_vec()),
-            summary: "Gambar".to_string(),
+            kind: PreviewKind::Image,
+            image: Some(PreviewImage::from_encoded_bytes(
+                data.to_vec(),
+                Some(mime_type),
+            )),
+            summary: "Image".to_string(),
             text_snippet: None,
             table_preview: Vec::new(),
             item_count: Some(1),
         },
         DocFormat::Unknown => PreviewThumbnail {
-            kind: "unknown".to_string(),
-            image_bytes: None,
+            kind: PreviewKind::Unknown,
+            image: None,
             summary: format_extension_summary(filename, data.len()),
             text_snippet: None,
             table_preview: Vec::new(),
@@ -239,7 +354,24 @@ pub fn generate_thumbnail(filename: &str, mime_type: &str, data: &[u8]) -> Previ
 }
 
 /// Generate a fuller preview when a document is opened.
+///
+/// Unsupported, invalid, or oversized inputs return a preview with
+/// [`PreviewKind::Unknown`].
 pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> DocumentPreview {
+    if data.len() > MAX_INPUT_SIZE_BYTES {
+        return DocumentPreview {
+            kind: PreviewKind::Unknown,
+            filename: filename.to_string(),
+            summary: "File exceeds the 64 MiB preview limit".to_string(),
+            page_images: Vec::new(),
+            total_pages: 0,
+            sheets: Vec::new(),
+            sections: Vec::new(),
+            raw_text: None,
+            archive_entries: Vec::new(),
+        };
+    }
+
     match detect_format(filename, mime_type, data) {
         DocFormat::Pdf => generate_pdf_preview(filename, data),
         DocFormat::Word => generate_word_preview(filename, data),
@@ -249,10 +381,13 @@ pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> Documen
         DocFormat::Archive => generate_archive_preview(filename, data),
         DocFormat::CodeOrText => generate_text_preview(filename, data),
         DocFormat::Image => DocumentPreview {
-            kind: "image".to_string(),
+            kind: PreviewKind::Image,
             filename: filename.to_string(),
-            summary: "Gambar".to_string(),
-            page_images: vec![data.to_vec()],
+            summary: "Image".to_string(),
+            page_images: vec![PreviewImage::from_encoded_bytes(
+                data.to_vec(),
+                Some(mime_type),
+            )],
             total_pages: 1,
             sheets: Vec::new(),
             sections: Vec::new(),
@@ -260,7 +395,7 @@ pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> Documen
             archive_entries: Vec::new(),
         },
         DocFormat::Unknown => DocumentPreview {
-            kind: "unknown".to_string(),
+            kind: PreviewKind::Unknown,
             filename: filename.to_string(),
             summary: format_extension_summary(filename, data.len()),
             page_images: Vec::new(),
@@ -318,9 +453,9 @@ fn generate_pdf_thumbnail(data: &[u8]) -> PreviewThumbnail {
         let count = pdf.pages().len() as u32;
         let page1_png = render_pdf_page_png(&pdf, 0, 460.0);
         return PreviewThumbnail {
-            kind: "pdf".to_string(),
-            image_bytes: page1_png,
-            summary: format!("{count} Halaman • PDF"),
+            kind: PreviewKind::Pdf,
+            image: page1_png.map(PreviewImage::from_png),
+            summary: format!("{count} pages • PDF"),
             text_snippet: None,
             table_preview: Vec::new(),
             item_count: Some(count),
@@ -328,9 +463,9 @@ fn generate_pdf_thumbnail(data: &[u8]) -> PreviewThumbnail {
     }
 
     PreviewThumbnail {
-        kind: "pdf".to_string(),
-        image_bytes: None,
-        summary: "Dokumen PDF".to_string(),
+        kind: PreviewKind::Pdf,
+        image: None,
+        summary: "PDF document".to_string(),
         text_snippet: None,
         table_preview: Vec::new(),
         item_count: None,
@@ -345,13 +480,13 @@ fn generate_pdf_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         let mut page_images = Vec::with_capacity(max_render);
         for idx in 0..max_render {
             if let Some(png) = render_pdf_page_png(&pdf, idx, 900.0) {
-                page_images.push(png);
+                page_images.push(PreviewImage::from_png(png));
             }
         }
         return DocumentPreview {
-            kind: "pdf".to_string(),
+            kind: PreviewKind::Pdf,
             filename: filename.to_string(),
-            summary: format!("{total} Halaman • PDF"),
+            summary: format!("{total} pages • PDF"),
             page_images,
             total_pages: total as u32,
             sheets: Vec::new(),
@@ -362,9 +497,9 @@ fn generate_pdf_preview(filename: &str, data: &[u8]) -> DocumentPreview {
     }
 
     DocumentPreview {
-        kind: "pdf".to_string(),
+        kind: PreviewKind::Pdf,
         filename: filename.to_string(),
-        summary: "Dokumen PDF".to_string(),
+        summary: "PDF document".to_string(),
         page_images: Vec::new(),
         total_pages: 0,
         sheets: Vec::new(),
@@ -400,32 +535,6 @@ fn extract_embedded_zip_thumbnail(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Op
     None
 }
 
-fn extract_zip_media_images(archive: &mut ZipArchive<Cursor<&[u8]>>, limit: usize) -> Vec<Vec<u8>> {
-    let mut images = Vec::new();
-    for i in 0..archive.len() {
-        if images.len() >= limit {
-            break;
-        }
-        if let Ok(mut file) = archive.by_index(i) {
-            let lower = file.name().to_ascii_lowercase();
-            let is_media = (lower.starts_with("word/media/")
-                || lower.starts_with("ppt/media/")
-                || lower.starts_with("xl/media/")
-                || lower.starts_with("pictures/"))
-                && (lower.ends_with(".png")
-                    || lower.ends_with(".jpg")
-                    || lower.ends_with(".jpeg"));
-            if is_media && file.size() > 0 && file.size() <= 4_000_000 {
-                let mut buf = Vec::with_capacity(file.size() as usize);
-                if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                    images.push(buf);
-                }
-            }
-        }
-    }
-    images
-}
-
 fn read_zip_entry_string(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
     let mut file = archive.by_name(name).ok()?;
     if file.size() > 16_000_000 {
@@ -440,67 +549,14 @@ fn read_zip_entry_string(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) ->
 // 3. Word / OpenDocument Text (.docx, .odt)
 // ============================================================================
 
-fn parse_docx_paragraphs(xml: &str) -> Vec<String> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(false);
-    let mut paragraphs = Vec::new();
-    let mut current_p = String::new();
-    let mut in_text = false;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                let local = e.local_name();
-                match local.as_ref() {
-                    b"p" => current_p.clear(),
-                    b"t" => in_text = true,
-                    b"tab" => current_p.push('\t'),
-                    b"br" | b"cr" => current_p.push('\n'),
-                    _ => {}
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let local = e.local_name();
-                match local.as_ref() {
-                    b"tab" => current_p.push('\t'),
-                    b"br" | b"cr" => current_p.push('\n'),
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(e)) if in_text => {
-                if let Ok(decoded) = e.unescape() {
-                    current_p.push_str(&decoded);
-                }
-            }
-            Ok(Event::End(e)) => {
-                let local = e.local_name();
-                match local.as_ref() {
-                    b"t" => in_text = false,
-                    b"p" => {
-                        let trimmed = current_p.trim();
-                        if !trimmed.is_empty() {
-                            paragraphs.push(trimmed.to_string());
-                        }
-                        current_p.clear();
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    paragraphs
-}
-
 fn generate_word_thumbnail(data: &[u8]) -> PreviewThumbnail {
     let mut archive = match ZipArchive::new(Cursor::new(data)) {
         Ok(a) => a,
         Err(_) => {
             return PreviewThumbnail {
-                kind: "document".to_string(),
-                image_bytes: None,
-                summary: "Dokumen Word".to_string(),
+                kind: PreviewKind::Document,
+                image: None,
+                summary: "Word document".to_string(),
                 text_snippet: None,
                 table_preview: Vec::new(),
                 item_count: None,
@@ -512,10 +568,7 @@ fn generate_word_thumbnail(data: &[u8]) -> PreviewThumbnail {
     let (sections, _page_pngs, rendered_thumb, para_count) =
         crate::render::render_docx_document(&mut archive, 1);
     let page_count = sections.len().max(1) as u32;
-    let snippet = sections
-        .first()
-        .map(|s| s.body.clone())
-        .unwrap_or_default();
+    let snippet = sections.first().map(|s| s.body.clone()).unwrap_or_default();
     let snippet_trimmed = if snippet.chars().count() > 320 {
         let s: String = snippet.chars().take(320).collect();
         format!("{s}…")
@@ -524,12 +577,14 @@ fn generate_word_thumbnail(data: &[u8]) -> PreviewThumbnail {
     };
 
     PreviewThumbnail {
-        kind: "document".to_string(),
-        image_bytes: embedded_thumb.or(rendered_thumb),
+        kind: PreviewKind::Document,
+        image: embedded_thumb
+            .or(rendered_thumb)
+            .map(|bytes| PreviewImage::from_encoded_bytes(bytes, None)),
         summary: if para_count > 0 {
-            format!("{page_count} Halaman • DOCX")
+            format!("{page_count} pages • DOCX")
         } else {
-            "Dokumen Word".to_string()
+            "Word document".to_string()
         },
         text_snippet: if snippet_trimmed.is_empty() {
             None
@@ -546,9 +601,9 @@ fn generate_word_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         Ok(a) => a,
         Err(_) => {
             return DocumentPreview {
-                kind: "document".to_string(),
+                kind: PreviewKind::Document,
                 filename: filename.to_string(),
-                summary: "Dokumen Word".to_string(),
+                summary: "Word document".to_string(),
                 page_images: Vec::new(),
                 total_pages: 0,
                 sheets: Vec::new(),
@@ -570,10 +625,10 @@ fn generate_word_preview(filename: &str, data: &[u8]) -> DocumentPreview {
 
     let page_count = sections.len().max(1) as u32;
     DocumentPreview {
-        kind: "document".to_string(),
+        kind: PreviewKind::Document,
         filename: filename.to_string(),
-        summary: format!("{page_count} Halaman • {para_count} Paragraf"),
-        page_images: page_pngs,
+        summary: format!("{page_count} pages • {para_count} paragraphs"),
+        page_images: page_pngs.into_iter().map(PreviewImage::from_png).collect(),
         total_pages: page_count,
         sheets: Vec::new(),
         sections,
@@ -754,7 +809,12 @@ fn parse_xlsx_worksheet(
     }
 
     // Normalize column count across rows
-    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0).min(max_cols);
+    let col_count = rows
+        .iter()
+        .map(|r| r.len())
+        .max()
+        .unwrap_or(0)
+        .min(max_cols);
     for r in &mut rows {
         r.resize(col_count, String::new());
     }
@@ -767,9 +827,9 @@ fn generate_xlsx_thumbnail(data: &[u8]) -> PreviewThumbnail {
         Ok(a) => a,
         Err(_) => {
             return PreviewThumbnail {
-                kind: "spreadsheet".to_string(),
-                image_bytes: None,
-                summary: "Spreadsheet Excel".to_string(),
+                kind: PreviewKind::Spreadsheet,
+                image: None,
+                summary: "Excel spreadsheet".to_string(),
                 text_snippet: None,
                 table_preview: Vec::new(),
                 item_count: None,
@@ -784,7 +844,8 @@ fn generate_xlsx_thumbnail(data: &[u8]) -> PreviewThumbnail {
     let sheet_names = read_zip_entry_string(&mut archive, "xl/workbook.xml")
         .map(|s| parse_xlsx_sheet_names(&s))
         .unwrap_or_default();
-    let sheet1_xml = read_zip_entry_string(&mut archive, "xl/worksheets/sheet1.xml").unwrap_or_default();
+    let sheet1_xml =
+        read_zip_entry_string(&mut archive, "xl/worksheets/sheet1.xml").unwrap_or_default();
     let (table_preview, total_rows) = parse_xlsx_worksheet(&sheet1_xml, &shared_strings, 5, 4);
     let (mut full_rows, _) = parse_xlsx_worksheet(&sheet1_xml, &shared_strings, 18, 8);
     let headers = if !full_rows.is_empty() {
@@ -805,9 +866,11 @@ fn generate_xlsx_thumbnail(data: &[u8]) -> PreviewThumbnail {
     let sheet_count = sheet_names.len().max(1) as u32;
 
     PreviewThumbnail {
-        kind: "spreadsheet".to_string(),
-        image_bytes: embedded_thumb.or(rendered_thumb),
-        summary: format!("{sheet_count} Sheet • {total_rows} Baris"),
+        kind: PreviewKind::Spreadsheet,
+        image: embedded_thumb
+            .or(rendered_thumb)
+            .map(|bytes| PreviewImage::from_encoded_bytes(bytes, None)),
+        summary: format!("{sheet_count} sheets • {total_rows} rows"),
         text_snippet: sheet_names.first().cloned(),
         table_preview,
         item_count: Some(sheet_count),
@@ -819,9 +882,9 @@ fn generate_xlsx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         Ok(a) => a,
         Err(_) => {
             return DocumentPreview {
-                kind: "spreadsheet".to_string(),
+                kind: PreviewKind::Spreadsheet,
                 filename: filename.to_string(),
-                summary: "Spreadsheet Excel".to_string(),
+                summary: "Excel spreadsheet".to_string(),
                 page_images: Vec::new(),
                 total_pages: 0,
                 sheets: Vec::new(),
@@ -841,7 +904,7 @@ fn generate_xlsx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
 
     let mut sheets = Vec::new();
     let mut page_images = Vec::new();
-    let max_sheets = sheet_names.len().max(1).min(10);
+    let max_sheets = sheet_names.len().clamp(1, 10);
     for idx in 0..max_sheets {
         let path = format!("xl/worksheets/sheet{}.xml", idx + 1);
         if let Some(xml) = read_zip_entry_string(&mut archive, &path) {
@@ -862,16 +925,16 @@ fn generate_xlsx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
                 total_rows,
             };
             if let Some(png) = crate::render::render_sheet_grid_png(&sheet, 1.45) {
-                page_images.push(png);
+                page_images.push(PreviewImage::from_png(png));
             }
             sheets.push(sheet);
         }
     }
 
     DocumentPreview {
-        kind: "spreadsheet".to_string(),
+        kind: PreviewKind::Spreadsheet,
         filename: filename.to_string(),
-        summary: format!("{} Sheet • Spreadsheet", sheets.len()),
+        summary: format!("{} sheets • Spreadsheet", sheets.len()),
         page_images,
         total_pages: sheets.len() as u32,
         sheets,
@@ -898,7 +961,12 @@ fn detect_csv_delimiter(filename: &str, data: &[u8]) -> u8 {
     }
 }
 
-fn parse_csv_rows(filename: &str, data: &[u8], max_rows: usize, max_cols: usize) -> (Vec<Vec<String>>, u32) {
+fn parse_csv_rows(
+    filename: &str,
+    data: &[u8],
+    max_rows: usize,
+    max_cols: usize,
+) -> (Vec<Vec<String>>, u32) {
     let delim = detect_csv_delimiter(filename, data);
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delim)
@@ -921,7 +989,12 @@ fn parse_csv_rows(filename: &str, data: &[u8], max_rows: usize, max_cols: usize)
             }
         }
     }
-    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0).min(max_cols);
+    let col_count = rows
+        .iter()
+        .map(|r| r.len())
+        .max()
+        .unwrap_or(0)
+        .min(max_cols);
     for r in &mut rows {
         r.resize(col_count, String::new());
     }
@@ -944,9 +1017,9 @@ fn generate_csv_thumbnail(filename: &str, data: &[u8]) -> PreviewThumbnail {
     };
     let rendered_thumb = crate::render::render_sheet_grid_png(&sheet, 1.1);
     PreviewThumbnail {
-        kind: "spreadsheet".to_string(),
-        image_bytes: rendered_thumb,
-        summary: format!("{total_rows} Baris • CSV"),
+        kind: PreviewKind::Spreadsheet,
+        image: rendered_thumb.map(PreviewImage::from_png),
+        summary: format!("{total_rows} rows • CSV"),
         text_snippet: None,
         table_preview,
         item_count: Some(total_rows),
@@ -967,12 +1040,12 @@ fn generate_csv_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         total_rows,
     };
     let page_images = crate::render::render_sheet_grid_png(&sheet, 1.45)
-        .into_iter()
-        .collect();
+        .map(|png| vec![PreviewImage::from_png(png)])
+        .unwrap_or_default();
     DocumentPreview {
-        kind: "spreadsheet".to_string(),
+        kind: PreviewKind::Spreadsheet,
         filename: filename.to_string(),
-        summary: format!("{total_rows} Baris • Tabel CSV"),
+        summary: format!("{total_rows} rows • CSV table"),
         page_images,
         total_pages: 1,
         sheets: vec![sheet],
@@ -991,9 +1064,9 @@ fn generate_pptx_thumbnail(data: &[u8]) -> PreviewThumbnail {
         Ok(a) => a,
         Err(_) => {
             return PreviewThumbnail {
-                kind: "presentation".to_string(),
-                image_bytes: None,
-                summary: "Presentasi".to_string(),
+                kind: PreviewKind::Presentation,
+                image: None,
+                summary: "Presentation".to_string(),
                 text_snippet: None,
                 table_preview: Vec::new(),
                 item_count: None,
@@ -1008,11 +1081,7 @@ fn generate_pptx_thumbnail(data: &[u8]) -> PreviewThumbnail {
     let first_slide = slides
         .first()
         .map(|s| {
-            let clean_title = s
-                .title
-                .split_once(": ")
-                .map(|(_, t)| t)
-                .unwrap_or(&s.title);
+            let clean_title = s.title.split_once(": ").map(|(_, t)| t).unwrap_or(&s.title);
             if s.body.is_empty() {
                 clean_title.to_string()
             } else {
@@ -1022,12 +1091,14 @@ fn generate_pptx_thumbnail(data: &[u8]) -> PreviewThumbnail {
         .unwrap_or_default();
 
     PreviewThumbnail {
-        kind: "presentation".to_string(),
-        image_bytes: rendered_thumb.or(embedded_thumb),
+        kind: PreviewKind::Presentation,
+        image: rendered_thumb
+            .or(embedded_thumb)
+            .map(|bytes| PreviewImage::from_encoded_bytes(bytes, None)),
         summary: if count > 0 {
-            format!("{count} Slide • PPTX")
+            format!("{count} slides • PPTX")
         } else {
-            "Presentasi".to_string()
+            "Presentation".to_string()
         },
         text_snippet: if first_slide.is_empty() {
             None
@@ -1044,9 +1115,9 @@ fn generate_pptx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         Ok(a) => a,
         Err(_) => {
             return DocumentPreview {
-                kind: "presentation".to_string(),
+                kind: PreviewKind::Presentation,
                 filename: filename.to_string(),
-                summary: "Presentasi".to_string(),
+                summary: "Presentation".to_string(),
                 page_images: Vec::new(),
                 total_pages: 0,
                 sheets: Vec::new(),
@@ -1057,8 +1128,7 @@ fn generate_pptx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         }
     };
 
-    let (sections, slide_images, _thumb) =
-        crate::render::render_pptx_document(&mut archive, 24);
+    let (sections, slide_images, _thumb) = crate::render::render_pptx_document(&mut archive, 24);
     let full_text = sections
         .iter()
         .map(|s| {
@@ -1072,10 +1142,13 @@ fn generate_pptx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         .join("\n\n");
 
     DocumentPreview {
-        kind: "presentation".to_string(),
+        kind: PreviewKind::Presentation,
         filename: filename.to_string(),
-        summary: format!("{} Slide • Presentasi", sections.len()),
-        page_images: slide_images,
+        summary: format!("{} slides • Presentation", sections.len()),
+        page_images: slide_images
+            .into_iter()
+            .map(PreviewImage::from_png)
+            .collect(),
         total_pages: sections.len() as u32,
         sheets: Vec::new(),
         sections,
@@ -1097,9 +1170,9 @@ fn generate_archive_thumbnail(data: &[u8]) -> PreviewThumbnail {
         Ok(a) => a,
         Err(_) => {
             return PreviewThumbnail {
-                kind: "archive".to_string(),
-                image_bytes: None,
-                summary: "Arsip Terkompresi".to_string(),
+                kind: PreviewKind::Archive,
+                image: None,
+                summary: "Compressed archive".to_string(),
                 text_snippet: None,
                 table_preview: Vec::new(),
                 item_count: None,
@@ -1121,9 +1194,9 @@ fn generate_archive_thumbnail(data: &[u8]) -> PreviewThumbnail {
     }
 
     PreviewThumbnail {
-        kind: "archive".to_string(),
-        image_bytes: None,
-        summary: format!("{file_count} File • Arsip ZIP"),
+        kind: PreviewKind::Archive,
+        image: None,
+        summary: format!("{file_count} files • ZIP archive"),
         text_snippet: if top_files.is_empty() {
             None
         } else {
@@ -1139,9 +1212,9 @@ fn generate_archive_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         Ok(a) => a,
         Err(_) => {
             return DocumentPreview {
-                kind: "archive".to_string(),
+                kind: PreviewKind::Archive,
                 filename: filename.to_string(),
-                summary: "Arsip ZIP".to_string(),
+                summary: "ZIP archive".to_string(),
                 page_images: Vec::new(),
                 total_pages: 0,
                 sheets: Vec::new(),
@@ -1166,7 +1239,7 @@ fn generate_archive_preview(filename: &str, data: &[u8]) -> DocumentPreview {
     }
 
     DocumentPreview {
-        kind: "archive".to_string(),
+        kind: PreviewKind::Archive,
         filename: filename.to_string(),
         summary: format!(
             "{} Item • Total {} KB",
@@ -1229,9 +1302,9 @@ fn generate_text_thumbnail(filename: &str, data: &[u8]) -> PreviewThumbnail {
         .unwrap_or("txt")
         .to_ascii_lowercase();
     let kind = if is_code_extension(&ext) {
-        "code"
+        PreviewKind::Code
     } else {
-        "text"
+        PreviewKind::Text
     };
 
     let raw = String::from_utf8_lossy(&data[..data.len().min(64_000)]).to_string();
@@ -1261,9 +1334,9 @@ fn generate_text_thumbnail(filename: &str, data: &[u8]) -> PreviewThumbnail {
         .join("\n");
 
     PreviewThumbnail {
-        kind: kind.to_string(),
-        image_bytes: None,
-        summary: format!("{total_lines} Baris • {}", ext.to_ascii_uppercase()),
+        kind,
+        image: None,
+        summary: format!("{total_lines} lines • {}", ext.to_ascii_uppercase()),
         text_snippet: if snippet.is_empty() {
             None
         } else {
@@ -1281,9 +1354,9 @@ fn generate_text_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         .unwrap_or("txt")
         .to_ascii_lowercase();
     let kind = if is_code_extension(&ext) {
-        "code"
+        PreviewKind::Code
     } else {
-        "text"
+        PreviewKind::Text
     };
 
     let raw = String::from_utf8_lossy(&data[..data.len().min(512_000)]).to_string();
@@ -1299,9 +1372,9 @@ fn generate_text_preview(filename: &str, data: &[u8]) -> DocumentPreview {
     let total_lines = formatted.lines().count() as u32;
 
     DocumentPreview {
-        kind: kind.to_string(),
+        kind,
         filename: filename.to_string(),
-        summary: format!("{total_lines} Baris • {}", ext.to_ascii_uppercase()),
+        summary: format!("{total_lines} lines • {}", ext.to_ascii_uppercase()),
         page_images: Vec::new(),
         total_pages: 1,
         sheets: Vec::new(),
@@ -1318,17 +1391,30 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[test]
+    fn unsupported_input_returns_unknown_preview_kind() {
+        let bytes = [0, 159, 255, 1, 2, 3];
+        let thumbnail = generate_thumbnail("sample.bin", "application/octet-stream", &bytes);
+        let preview = generate_preview("sample.bin", "application/octet-stream", &bytes);
+
+        assert_eq!(thumbnail.kind, PreviewKind::Unknown);
+        assert_eq!(preview.kind, PreviewKind::Unknown);
+    }
+
+    #[test]
     fn preview_csv_parses_table_and_preview() {
         let csv_data = b"Name,Role,Department,Location\nAlice,Engineer,Research,North\nBob,Designer,Product,West\n";
         let thumb = generate_thumbnail("sample.csv", "text/csv", csv_data);
-        assert_eq!(thumb.kind, "spreadsheet");
+        assert_eq!(thumb.kind, PreviewKind::Spreadsheet);
         assert_eq!(thumb.table_preview.len(), 3);
         assert_eq!(thumb.table_preview[0][0], "Name");
         assert_eq!(thumb.table_preview[1][0], "Alice");
 
         let preview = generate_preview("sample.csv", "text/csv", csv_data);
         assert_eq!(preview.sheets.len(), 1);
-        assert_eq!(preview.sheets[0].headers, vec!["Name", "Role", "Department", "Location"]);
+        assert_eq!(
+            preview.sheets[0].headers,
+            vec!["Name", "Role", "Department", "Location"]
+        );
         assert_eq!(preview.sheets[0].rows.len(), 2);
     }
 
@@ -1356,8 +1442,12 @@ mod tests {
         let bytes = buf.into_inner();
 
         let thumb = generate_thumbnail("sample.docx", "application/octet-stream", &bytes);
-        assert_eq!(thumb.kind, "document");
-        assert!(thumb.image_bytes.is_some(), "Should extract docProps/thumbnail.jpeg fast-path");
+        assert_eq!(thumb.kind, PreviewKind::Document);
+        assert!(
+            thumb.image.is_some(),
+            "Should extract docProps/thumbnail.jpeg fast-path"
+        );
+        assert_eq!(thumb.image.as_ref().unwrap().mime_type, "image/jpeg");
         assert!(thumb
             .text_snippet
             .as_deref()
@@ -1365,9 +1455,11 @@ mod tests {
             .contains("Sample document title"));
 
         let preview = generate_preview("sample.docx", "application/octet-stream", &bytes);
-        assert_eq!(preview.kind, "document");
+        assert_eq!(preview.kind, PreviewKind::Document);
         assert_eq!(preview.sections.len(), 1);
-        assert!(preview.sections[0].body.contains("Preview text extraction works."));
+        assert!(preview.sections[0]
+            .body
+            .contains("Preview text extraction works."));
     }
 
     #[test]
@@ -1377,8 +1469,10 @@ mod tests {
             let mut zip = zip::ZipWriter::new(&mut buf);
             let opts = SimpleFileOptions::default();
             zip.start_file("xl/workbook.xml", opts).unwrap();
-            zip.write_all(br#"<workbook><sheets><sheet name="Summary" sheetId="1"/></sheets></workbook>"#)
-                .unwrap();
+            zip.write_all(
+                br#"<workbook><sheets><sheet name="Summary" sheetId="1"/></sheets></workbook>"#,
+            )
+            .unwrap();
             zip.start_file("xl/sharedStrings.xml", opts).unwrap();
             zip.write_all(
                 br#"<sst><si><t>Month</t></si><si><t>Revenue</t></si><si><t>January</t></si></sst>"#,
@@ -1397,7 +1491,7 @@ mod tests {
         let bytes = buf.into_inner();
 
         let thumb = generate_thumbnail("sample.xlsx", "application/octet-stream", &bytes);
-        assert_eq!(thumb.kind, "spreadsheet");
+        assert_eq!(thumb.kind, PreviewKind::Spreadsheet);
         assert_eq!(thumb.table_preview.len(), 2);
         assert_eq!(thumb.table_preview[0], vec!["Month", "Revenue"]);
         assert_eq!(thumb.table_preview[1], vec!["January", "15000000"]);
@@ -1424,7 +1518,7 @@ mod tests {
         let bytes = buf.into_inner();
 
         let thumb = generate_thumbnail("bundle.zip", "application/zip", &bytes);
-        assert_eq!(thumb.kind, "archive");
+        assert_eq!(thumb.kind, PreviewKind::Archive);
         assert_eq!(thumb.item_count, Some(2));
 
         let preview = generate_preview("bundle.zip", "application/zip", &bytes);
@@ -1454,13 +1548,14 @@ startxref\n\
 %%EOF\n";
 
         let thumb = generate_thumbnail("sample.pdf", "application/pdf", minimal_pdf);
-        assert_eq!(thumb.kind, "pdf");
+        assert_eq!(thumb.kind, PreviewKind::Pdf);
         assert_eq!(thumb.item_count, Some(1));
-        assert!(thumb.image_bytes.is_some(), "PDF page 1 should rasterize to PNG");
-        assert!(thumb.image_bytes.as_ref().unwrap().starts_with(b"\x89PNG"));
+        assert!(thumb.image.is_some(), "PDF page 1 should rasterize to PNG");
+        assert!(thumb.image.as_ref().unwrap().bytes.starts_with(b"\x89PNG"));
+        assert_eq!(thumb.image.as_ref().unwrap().mime_type, "image/png");
 
         let preview = generate_preview("sample.pdf", "application/pdf", minimal_pdf);
-        assert_eq!(preview.kind, "pdf");
+        assert_eq!(preview.kind, PreviewKind::Pdf);
         assert_eq!(preview.total_pages, 1);
         assert_eq!(preview.page_images.len(), 1);
     }
@@ -1501,11 +1596,13 @@ startxref\n\
         }
         let pptx_bytes = pptx_buf.into_inner();
         let pptx_thumb = generate_thumbnail("sample.pptx", "application/octet-stream", &pptx_bytes);
-        assert_eq!(pptx_thumb.kind, "presentation");
-        assert!(pptx_thumb.image_bytes.as_ref().is_some_and(|b| b.starts_with(b"\x89PNG")));
+        assert_eq!(pptx_thumb.kind, PreviewKind::Presentation);
+        assert!(pptx_thumb
+            .image
+            .as_ref()
+            .is_some_and(|image| image.bytes.starts_with(b"\x89PNG")));
         let pptx_prev = generate_preview("sample.pptx", "application/octet-stream", &pptx_bytes);
         assert_eq!(pptx_prev.page_images.len(), 1);
-        assert!(pptx_prev.page_images[0].starts_with(b"\x89PNG"));
-
+        assert!(pptx_prev.page_images[0].bytes.starts_with(b"\x89PNG"));
     }
 }

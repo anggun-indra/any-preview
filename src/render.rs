@@ -13,6 +13,9 @@ use std::io::{Cursor, Read};
 use std::sync::{Arc, OnceLock};
 use zip::ZipArchive;
 
+type GroupTransform = (f32, f32, f32, f32, f32, f32, f32, f32);
+type DocxRenderOutput = (Vec<PreviewSection>, Vec<Vec<u8>>, Option<Vec<u8>>, usize);
+
 fn shared_fontdb() -> Arc<fontdb::Database> {
     static DB: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
     Arc::clone(DB.get_or_init(|| {
@@ -32,9 +35,11 @@ pub fn prewarm_font_database() {
 }
 
 pub fn render_svg_to_png(svg: &str, scale: f32) -> Option<Vec<u8>> {
-    let mut opt = Options::default();
-    opt.fontdb = shared_fontdb();
-    opt.font_family = "Arial".to_string();
+    let opt = Options {
+        fontdb: shared_fontdb(),
+        font_family: "Arial".to_string(),
+        ..Options::default()
+    };
     let tree = Tree::from_str(svg, &opt).ok()?;
     let size = tree.size();
     let w = ((size.width() * scale).round() as u32).clamp(1, 2400);
@@ -156,9 +161,7 @@ fn parse_rels_map(xml: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e) | Event::Empty(e))
-                if e.local_name().as_ref() == b"Relationship" =>
-            {
+            Ok(Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == b"Relationship" => {
                 if let (Some(id), Some(target)) = (attr_val(&e, b"Id"), attr_val(&e, b"Target")) {
                     map.insert(id, target);
                 }
@@ -174,10 +177,7 @@ fn resolve_zip_rel_path(base_dir: &str, target: &str) -> String {
     if let Some(stripped) = target.strip_prefix('/') {
         return stripped.to_string();
     }
-    let mut parts: Vec<&str> = base_dir
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut parts: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
     for seg in target.split('/') {
         match seg {
             "" | "." => {}
@@ -329,8 +329,7 @@ fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
                     | b"accent4" | b"accent5" | b"accent6"
                         if in_clr_scheme =>
                     {
-                        current_slot =
-                            Some(String::from_utf8_lossy(local.as_ref()).to_string());
+                        current_slot = Some(String::from_utf8_lossy(local.as_ref()).to_string());
                     }
                     b"srgbClr" if current_slot.is_some() => {
                         if let Some(val) = attr_val(&e, b"val") {
@@ -340,8 +339,7 @@ fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
                         }
                     }
                     b"sysClr" if current_slot.is_some() => {
-                        if let Some(val) =
-                            attr_val(&e, b"lastClr").or_else(|| attr_val(&e, b"val"))
+                        if let Some(val) = attr_val(&e, b"lastClr").or_else(|| attr_val(&e, b"val"))
                         {
                             if val.len() == 6 {
                                 if let Some(slot) = &current_slot {
@@ -364,8 +362,7 @@ fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
                         }
                     }
                     b"sysClr" if current_slot.is_some() => {
-                        if let Some(val) =
-                            attr_val(&e, b"lastClr").or_else(|| attr_val(&e, b"val"))
+                        if let Some(val) = attr_val(&e, b"lastClr").or_else(|| attr_val(&e, b"val"))
                         {
                             if val.len() == 6 {
                                 if let Some(slot) = &current_slot {
@@ -470,7 +467,7 @@ fn parse_pptx_slide_xml(
     let mut in_ln_spc = false;
 
     // Group transform stack: (gx, gy, gcx, gcy, chx, chy, chcx, chcy)
-    let mut grp_stack: Vec<(f32, f32, f32, f32, f32, f32, f32, f32)> = Vec::new();
+    let mut grp_stack: Vec<GroupTransform> = Vec::new();
     let mut in_grp_sp_pr = false;
 
     loop {
@@ -577,8 +574,7 @@ fn parse_pptx_slide_xml(
                     b"moveTo" | b"lnTo" | b"cubicBezTo" | b"quadBezTo"
                         if current_path.is_some() =>
                     {
-                        path_cmd_tag =
-                            Some(String::from_utf8_lossy(local.as_ref()).to_string());
+                        path_cmd_tag = Some(String::from_utf8_lossy(local.as_ref()).to_string());
                         path_pts.clear();
                     }
                     b"txBody" => in_tx_body = true,
@@ -806,17 +802,14 @@ fn parse_pptx_slide_xml(
                         }
                     }
                     b"alpha" => {
-                        if let Some(a) = attr_val(&e, b"val")
-                            .and_then(|v| v.parse::<f32>().ok())
-                        {
+                        if let Some(a) = attr_val(&e, b"val").and_then(|v| v.parse::<f32>().ok()) {
                             if let Some(c) = &mut active_color {
                                 c.alpha = (a / 100_000.0).clamp(0.0, 1.0);
                             }
                         }
                     }
                     b"lin" if in_grad => {
-                        if let Some(ang) = attr_val(&e, b"ang")
-                            .and_then(|v| v.parse::<f32>().ok())
+                        if let Some(ang) = attr_val(&e, b"ang").and_then(|v| v.parse::<f32>().ok())
                         {
                             grad_angle = ang / 60_000.0;
                         }
@@ -861,7 +854,8 @@ fn parse_pptx_slide_xml(
                     }
                     b"buChar" if current_para.is_some() => {
                         if let Some(p) = &mut current_para {
-                            p.bullet = Some(attr_val(&e, b"char").unwrap_or_else(|| "•".to_string()));
+                            p.bullet =
+                                Some(attr_val(&e, b"char").unwrap_or_else(|| "•".to_string()));
                         }
                     }
                     b"buNone" if current_para.is_some() => {
@@ -870,8 +864,7 @@ fn parse_pptx_slide_xml(
                         }
                     }
                     b"spcPct" if in_ln_spc => {
-                        if let Some(val) = attr_val(&e, b"val")
-                            .and_then(|v| v.parse::<f32>().ok())
+                        if let Some(val) = attr_val(&e, b"val").and_then(|v| v.parse::<f32>().ok())
                         {
                             if let Some(p) = &mut current_para {
                                 p.line_spacing_mult = (val / 100_000.0).clamp(0.85, 2.5);
@@ -879,8 +872,7 @@ fn parse_pptx_slide_xml(
                         }
                     }
                     b"spcPts" => {
-                        if let Some(val) = attr_val(&e, b"val")
-                            .and_then(|v| v.parse::<f32>().ok())
+                        if let Some(val) = attr_val(&e, b"val").and_then(|v| v.parse::<f32>().ok())
                         {
                             let pts = val / 100.0;
                             if let Some(p) = &mut current_para {
@@ -1221,8 +1213,7 @@ fn render_pptx_slide_svg(
             _ => r#"stroke="none""#.to_string(),
         };
 
-        let has_visible_paint =
-            !matches!(sh.fill, PptxFill::None) || sh.stroke.is_some();
+        let has_visible_paint = !matches!(sh.fill, PptxFill::None) || sh.stroke.is_some();
 
         if has_visible_paint && w > 0.5 && h > 0.5 {
             if !sh.cust_paths.is_empty() {
@@ -1375,14 +1366,7 @@ struct WrappedSlideLine {
     margin_left_pt: f32,
 }
 
-fn render_pptx_textbox_svg(
-    body: &mut String,
-    sh: &PptxShape,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-) {
+fn render_pptx_textbox_svg(body: &mut String, sh: &PptxShape, x: f32, y: f32, w: f32, h: f32) {
     let inner_x = x + sh.ins_l_pt;
     let inner_w = (w - sh.ins_l_pt - sh.ins_r_pt).max(12.0);
     let mut lines: Vec<WrappedSlideLine> = Vec::new();
@@ -1622,7 +1606,7 @@ pub fn render_pptx_document(
 // PART 2: Word (.docx) Layout Mapper (`WMDocumentMapper`)
 // ============================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct DocxStyle {
     based_on: Option<String>,
     font_family: Option<String>,
@@ -1638,27 +1622,6 @@ struct DocxStyle {
     indent_left_pt: Option<f32>,
     indent_first_line_pt: Option<f32>,
     outline_lvl: Option<u8>,
-}
-
-impl Default for DocxStyle {
-    fn default() -> Self {
-        Self {
-            based_on: None,
-            font_family: None,
-            font_size_pt: None,
-            bold: None,
-            italic: None,
-            underline: None,
-            color_hex: None,
-            align: None,
-            space_before_pt: None,
-            space_after_pt: None,
-            line_mult: None,
-            indent_left_pt: None,
-            indent_first_line_pt: None,
-            outline_lvl: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2138,14 +2101,10 @@ fn parse_docx_body(
                         drawing_h_pt = 140.0;
                     }
                     b"extent" if in_drawing => {
-                        if let Some(cx) =
-                            attr_val(&e, b"cx").and_then(|v| v.parse::<f32>().ok())
-                        {
+                        if let Some(cx) = attr_val(&e, b"cx").and_then(|v| v.parse::<f32>().ok()) {
                             drawing_w_pt = (cx / 12700.0).clamp(24.0, 480.0);
                         }
-                        if let Some(cy) =
-                            attr_val(&e, b"cy").and_then(|v| v.parse::<f32>().ok())
-                        {
+                        if let Some(cy) = attr_val(&e, b"cy").and_then(|v| v.parse::<f32>().ok()) {
                             drawing_h_pt = (cy / 12700.0).clamp(16.0, 600.0);
                         }
                     }
@@ -2189,14 +2148,10 @@ fn parse_docx_body(
                         }
                     }
                     b"extent" if in_drawing => {
-                        if let Some(cx) =
-                            attr_val(&e, b"cx").and_then(|v| v.parse::<f32>().ok())
-                        {
+                        if let Some(cx) = attr_val(&e, b"cx").and_then(|v| v.parse::<f32>().ok()) {
                             drawing_w_pt = (cx / 12700.0).clamp(24.0, 480.0);
                         }
-                        if let Some(cy) =
-                            attr_val(&e, b"cy").and_then(|v| v.parse::<f32>().ok())
-                        {
+                        if let Some(cy) = attr_val(&e, b"cy").and_then(|v| v.parse::<f32>().ok()) {
                             drawing_h_pt = (cy / 12700.0).clamp(16.0, 600.0);
                         }
                     }
@@ -2483,11 +2438,7 @@ struct DocxWrappedLine {
     tokens: Vec<DocxWordToken>,
 }
 
-fn wrap_docx_paragraph(
-    p: &DocxParagraphBlock,
-    base_x: f32,
-    max_w: f32,
-) -> Vec<DocxWrappedLine> {
+fn wrap_docx_paragraph(p: &DocxParagraphBlock, base_x: f32, max_w: f32) -> Vec<DocxWrappedLine> {
     let mut words: Vec<DocxWordToken> = Vec::new();
     if p.is_list_item {
         let fam = map_font_family(&p.style.font_family);
@@ -2554,8 +2505,8 @@ fn wrap_docx_paragraph(
 
     for tok in words {
         let line_x = base_x + indent_left + if is_first_line { first_indent } else { 0.0 };
-        let line_avail = (max_w - indent_left - if is_first_line { first_indent } else { 0.0 })
-            .max(40.0);
+        let line_avail =
+            (max_w - indent_left - if is_first_line { first_indent } else { 0.0 }).max(40.0);
 
         let added_w = if current_tokens.is_empty() {
             tok.width_pt
@@ -2588,8 +2539,8 @@ fn wrap_docx_paragraph(
 
     if !current_tokens.is_empty() {
         let line_x = base_x + indent_left + if is_first_line { first_indent } else { 0.0 };
-        let line_avail = (max_w - indent_left - if is_first_line { first_indent } else { 0.0 })
-            .max(40.0);
+        let line_avail =
+            (max_w - indent_left - if is_first_line { first_indent } else { 0.0 }).max(40.0);
         let max_sz = current_tokens
             .iter()
             .map(|t| t.font_size_pt)
@@ -2696,7 +2647,7 @@ fn emit_docx_line_svg(svg_body: &mut String, line: &DocxWrappedLine, baseline_y:
 pub fn render_docx_document(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
     max_rendered_pages: usize,
-) -> (Vec<PreviewSection>, Vec<Vec<u8>>, Option<Vec<u8>>, usize) {
+) -> DocxRenderOutput {
     let styles_xml = read_zip_string(archive, "word/styles.xml").unwrap_or_default();
     let (defaults, styles) = parse_docx_styles(&styles_xml);
     let rels = read_zip_string(archive, "word/_rels/document.xml.rels")
@@ -2845,8 +2796,11 @@ pub fn render_docx_document(
                             if !t.trim().is_empty() {
                                 current_texts.push(t.trim().to_string());
                             }
-                            let mut wl =
-                                wrap_docx_paragraph(cp, cell_x + pad_x, (col_w - pad_x * 2.0).max(20.0));
+                            let mut wl = wrap_docx_paragraph(
+                                cp,
+                                cell_x + pad_x,
+                                (col_w - pad_x * 2.0).max(20.0),
+                            );
                             c_lines.append(&mut wl);
                         }
                         let ch: f32 =
@@ -2903,7 +2857,11 @@ pub fn render_docx_document(
     let mut page_pngs = Vec::new();
     let mut thumb_png: Option<Vec<u8>> = None;
 
-    for (idx, (svg, texts)) in page_svgs.into_iter().zip(page_texts.into_iter()).enumerate() {
+    for (idx, (svg, texts)) in page_svgs
+        .into_iter()
+        .zip(page_texts.into_iter())
+        .enumerate()
+    {
         let heading = texts.first().map(|h| {
             if h.chars().count() > 46 {
                 let s: String = h.chars().take(46).collect();
@@ -2961,7 +2919,7 @@ pub fn render_sheet_grid_png(sheet: &PreviewSheet, target_scale: f32) -> Option<
 
     let row_num_w = 34.0f32;
     let mut col_widths = vec![85.0f32; col_count];
-    for c in 0..col_count {
+    for (c, col_width) in col_widths.iter_mut().enumerate() {
         let max_chars = all_rows
             .iter()
             .filter_map(|r| r.get(c))
@@ -2969,7 +2927,7 @@ pub fn render_sheet_grid_png(sheet: &PreviewSheet, target_scale: f32) -> Option<
             .max()
             .unwrap_or(6)
             .clamp(6, 28);
-        col_widths[c] = (max_chars as f32 * 6.8 + 18.0).clamp(68.0, 210.0);
+        *col_width = (max_chars as f32 * 6.8 + 18.0).clamp(68.0, 210.0);
     }
 
     let total_w: f32 = row_num_w + col_widths.iter().sum::<f32>();
@@ -2988,7 +2946,7 @@ pub fn render_sheet_grid_png(sheet: &PreviewSheet, target_scale: f32) -> Option<
         r##"<rect x="0" y="0" width="{total_w:.2}" height="{header_bar_h:.2}" fill="#107C41"/>"##
     ));
     body.push_str(&format!(
-        r##"<text x="12" y="18.5" font-family="Arial, sans-serif" font-size="11.5" font-weight="bold" fill="#FFFFFF">Sheet: {} ({} baris)</text>"##,
+        r##"<text x="12" y="18.5" font-family="Arial, sans-serif" font-size="11.5" font-weight="bold" fill="#FFFFFF">Sheet: {} ({} rows)</text>"##,
         xml_escape(&sheet.name),
         sheet.total_rows
     ));
@@ -3054,7 +3012,8 @@ pub fn render_sheet_grid_png(sheet: &PreviewSheet, target_scale: f32) -> Option<
                     };
                     let is_num = !is_header
                         && trimmed.chars().all(|c| {
-                            c.is_ascii_digit() || matches!(c, '.' | ',' | '-' | '%' | 'R' | 'p' | '$')
+                            c.is_ascii_digit()
+                                || matches!(c, '.' | ',' | '-' | '%' | 'R' | 'p' | '$')
                         });
                     let (tx, anchor) = if is_num {
                         (cell_x + cw - 6.0, "end")
