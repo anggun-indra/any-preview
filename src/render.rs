@@ -1515,11 +1515,13 @@ pub fn render_pptx_document(
     let mut slide_indices = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
-            let name = file.name().to_string();
-            if let Some(rest) = name.strip_prefix("ppt/slides/slide") {
-                if let Some(num_str) = rest.strip_suffix(".xml") {
-                    if let Ok(num) = num_str.parse::<u32>() {
-                        slide_indices.push((num, name));
+            if let Ok(name) = file.name() {
+                let name = name.into_owned();
+                if let Some(rest) = name.strip_prefix("ppt/slides/slide") {
+                    if let Some(num_str) = rest.strip_suffix(".xml") {
+                        if let Ok(num) = num_str.parse::<u32>() {
+                            slide_indices.push((num, name));
+                        }
                     }
                 }
             }

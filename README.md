@@ -14,6 +14,8 @@ The current implementation has preview paths for:
 - PPTX, PPTM
 - ZIP, JAR, APK, IPA, EPUB, WHL
 - PNG, JPEG, GIF, WebP, BMP
+- HTML (`.html`, `.htm`, `.xhtml`) as browser-renderable source
+- Markdown (`.md`, `.markdown`), JSON, XML, and YAML with raw and formatted text
 - Common text and source-code formats
 
 ODF spreadsheets and presentations, and Keynote files, are recognized but do not
@@ -42,7 +44,7 @@ When the crate is published, add it to `Cargo.toml`:
 
 ```toml
 [dependencies]
-any-preview = "0.1"
+any-preview = "0.3"
 ```
 
 The crate name uses a hyphen in `Cargo.toml`; Rust code imports it as `any_preview`.
@@ -55,6 +57,18 @@ preview request.
 
 Thumbnail and page image values include both encoded bytes and a MIME type, so
 callers can pass them directly to their image decoder.
+
+Text previews preserve the source in `DocumentPreview::raw_text`. Valid JSON,
+XML, and YAML files also include a pretty-printed `formatted_text`; invalid
+structured text remains available as raw text. Markdown is identified with the
+`markdown` preview kind so UI applications can render it while retaining the
+source for a raw view. Other source-code files are returned unchanged so a
+preview never silently rewrites an attachment.
+
+HTML is identified with the `html` preview kind and returned as source text for
+the host application to render. The crate does not provide UI labels or a
+browser widget; applications own those controls and their localization. Summary
+text returned by the crate is in English.
 
 ## License
 

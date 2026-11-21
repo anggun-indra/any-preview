@@ -11,6 +11,8 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{render, PixmapSettings, RenderCache, RenderSettings};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::Writer;
+use saphyr::{LoadableYamlNode, Yaml, YamlEmitter};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 use zip::ZipArchive;
@@ -128,6 +130,8 @@ pub struct DocumentPreview {
     pub sections: Vec<PreviewSection>,
     /// Raw text or source code content (TXT, MD, JSON, XML, YAML, Code).
     pub raw_text: Option<String>,
+    /// Pretty-printed source for structured text formats when parsing succeeds.
+    pub formatted_text: Option<String>,
     /// Archive directory listing (ZIP, JAR, APK, EPUB).
     pub archive_entries: Vec<ArchiveEntry>,
 }
@@ -151,6 +155,10 @@ pub enum PreviewKind {
     Code,
     /// Plain text.
     Text,
+    /// Markdown document.
+    Markdown,
+    /// HTML document intended for rendering by a host application's browser view.
+    Html,
     /// Raster image.
     Image,
     /// Unsupported, invalid, or oversized input.
@@ -168,6 +176,8 @@ impl PreviewKind {
             Self::Archive => "archive",
             Self::Code => "code",
             Self::Text => "text",
+            Self::Markdown => "markdown",
+            Self::Html => "html",
             Self::Image => "image",
             Self::Unknown => "unknown",
         }
@@ -182,6 +192,8 @@ enum DocFormat {
     Csv,
     Presentation,
     Archive,
+    Markdown,
+    Html,
     CodeOrText,
     Image,
     Unknown,
@@ -228,11 +240,19 @@ fn detect_format(filename: &str, mime_type: &str, data: &[u8]) -> DocFormat {
     {
         return DocFormat::Archive;
     }
+    if matches!(ext, "md" | "markdown") || mime_type == "text/markdown" {
+        return DocFormat::Markdown;
+    }
+    let mime_essence = mime_type.split(';').next().unwrap_or(mime_type).trim();
+    if matches!(ext, "html" | "htm" | "xhtml")
+        || mime_essence.eq_ignore_ascii_case("text/html")
+        || mime_essence.eq_ignore_ascii_case("application/xhtml+xml")
+    {
+        return DocFormat::Html;
+    }
     if matches!(
         ext,
         "txt"
-            | "md"
-            | "markdown"
             | "json"
             | "xml"
             | "yaml"
@@ -291,15 +311,16 @@ fn inspect_zip_flavor(data: &[u8]) -> DocFormat {
     if let Ok(mut archive) = ZipArchive::new(Cursor::new(data)) {
         for i in 0..archive.len().min(30) {
             if let Ok(file) = archive.by_index(i) {
-                let name = file.name();
-                if name.starts_with("word/") {
-                    return DocFormat::Word;
-                }
-                if name.starts_with("xl/") {
-                    return DocFormat::Spreadsheet;
-                }
-                if name.starts_with("ppt/") {
-                    return DocFormat::Presentation;
+                if let Ok(name) = file.name() {
+                    if name.starts_with("word/") {
+                        return DocFormat::Word;
+                    }
+                    if name.starts_with("xl/") {
+                        return DocFormat::Spreadsheet;
+                    }
+                    if name.starts_with("ppt/") {
+                        return DocFormat::Presentation;
+                    }
                 }
             }
         }
@@ -330,7 +351,13 @@ pub fn generate_thumbnail(filename: &str, mime_type: &str, data: &[u8]) -> Previ
         DocFormat::Csv => generate_csv_thumbnail(filename, data),
         DocFormat::Presentation => generate_pptx_thumbnail(data),
         DocFormat::Archive => generate_archive_thumbnail(data),
-        DocFormat::CodeOrText => generate_text_thumbnail(filename, data),
+        DocFormat::CodeOrText => generate_text_thumbnail(filename, mime_type, data, None),
+        DocFormat::Markdown => {
+            generate_text_thumbnail(filename, mime_type, data, Some(PreviewKind::Markdown))
+        }
+        DocFormat::Html => {
+            generate_text_thumbnail(filename, mime_type, data, Some(PreviewKind::Html))
+        }
         DocFormat::Image => PreviewThumbnail {
             kind: PreviewKind::Image,
             image: Some(PreviewImage::from_encoded_bytes(
@@ -368,6 +395,7 @@ pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> Documen
             sheets: Vec::new(),
             sections: Vec::new(),
             raw_text: None,
+            formatted_text: None,
             archive_entries: Vec::new(),
         };
     }
@@ -379,7 +407,13 @@ pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> Documen
         DocFormat::Csv => generate_csv_preview(filename, data),
         DocFormat::Presentation => generate_pptx_preview(filename, data),
         DocFormat::Archive => generate_archive_preview(filename, data),
-        DocFormat::CodeOrText => generate_text_preview(filename, data),
+        DocFormat::CodeOrText => generate_text_preview(filename, mime_type, data, None),
+        DocFormat::Markdown => {
+            generate_text_preview(filename, mime_type, data, Some(PreviewKind::Markdown))
+        }
+        DocFormat::Html => {
+            generate_text_preview(filename, mime_type, data, Some(PreviewKind::Html))
+        }
         DocFormat::Image => DocumentPreview {
             kind: PreviewKind::Image,
             filename: filename.to_string(),
@@ -392,6 +426,7 @@ pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> Documen
             sheets: Vec::new(),
             sections: Vec::new(),
             raw_text: None,
+            formatted_text: None,
             archive_entries: Vec::new(),
         },
         DocFormat::Unknown => DocumentPreview {
@@ -403,6 +438,7 @@ pub fn generate_preview(filename: &str, mime_type: &str, data: &[u8]) -> Documen
             sheets: Vec::new(),
             sections: Vec::new(),
             raw_text: None,
+            formatted_text: None,
             archive_entries: Vec::new(),
         },
     }
@@ -492,6 +528,7 @@ fn generate_pdf_preview(filename: &str, data: &[u8]) -> DocumentPreview {
             sheets: Vec::new(),
             sections: Vec::new(),
             raw_text: None,
+            formatted_text: None,
             archive_entries: Vec::new(),
         };
     }
@@ -505,6 +542,7 @@ fn generate_pdf_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         sheets: Vec::new(),
         sections: Vec::new(),
         raw_text: None,
+        formatted_text: None,
         archive_entries: Vec::new(),
     }
 }
@@ -609,6 +647,7 @@ fn generate_word_preview(filename: &str, data: &[u8]) -> DocumentPreview {
                 sheets: Vec::new(),
                 sections: Vec::new(),
                 raw_text: None,
+                formatted_text: None,
                 archive_entries: Vec::new(),
             }
         }
@@ -637,6 +676,7 @@ fn generate_word_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         } else {
             Some(full_text)
         },
+        formatted_text: None,
         archive_entries: Vec::new(),
     }
 }
@@ -888,6 +928,7 @@ fn generate_xlsx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
                 sheets: Vec::new(),
                 sections: Vec::new(),
                 raw_text: None,
+                formatted_text: None,
                 archive_entries: Vec::new(),
             }
         }
@@ -938,6 +979,7 @@ fn generate_xlsx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         sheets,
         sections: Vec::new(),
         raw_text: None,
+        formatted_text: None,
         archive_entries: Vec::new(),
     }
 }
@@ -1049,6 +1091,7 @@ fn generate_csv_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         sheets: vec![sheet],
         sections: Vec::new(),
         raw_text: None,
+        formatted_text: None,
         archive_entries: Vec::new(),
     }
 }
@@ -1121,6 +1164,7 @@ fn generate_pptx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
                 sheets: Vec::new(),
                 sections: Vec::new(),
                 raw_text: None,
+                formatted_text: None,
                 archive_entries: Vec::new(),
             }
         }
@@ -1155,6 +1199,7 @@ fn generate_pptx_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         } else {
             Some(full_text)
         },
+        formatted_text: None,
         archive_entries: Vec::new(),
     }
 }
@@ -1185,7 +1230,9 @@ fn generate_archive_thumbnail(data: &[u8]) -> PreviewThumbnail {
             if !file.is_dir() {
                 file_count += 1;
                 if top_files.len() < 4 {
-                    top_files.push(format!("📦 {}", file.name()));
+                    if let Ok(name) = file.name() {
+                        top_files.push(format!("📦 {name}"));
+                    }
                 }
             }
         }
@@ -1218,6 +1265,7 @@ fn generate_archive_preview(filename: &str, data: &[u8]) -> DocumentPreview {
                 sheets: Vec::new(),
                 sections: Vec::new(),
                 raw_text: None,
+                formatted_text: None,
                 archive_entries: Vec::new(),
             }
         }
@@ -1227,12 +1275,17 @@ fn generate_archive_preview(filename: &str, data: &[u8]) -> DocumentPreview {
     let mut total_uncompressed = 0u64;
     for i in 0..archive.len().min(500) {
         if let Ok(file) = archive.by_index(i) {
-            total_uncompressed += file.size();
-            entries.push(ArchiveEntry {
-                path: file.name().to_string(),
-                size_bytes: file.size(),
-                is_dir: file.is_dir(),
-            });
+            if let Ok(name) = file.name() {
+                let path = name.into_owned();
+                let size_bytes = file.size();
+                let is_dir = file.is_dir();
+                total_uncompressed += size_bytes;
+                entries.push(ArchiveEntry {
+                    path,
+                    size_bytes,
+                    is_dir,
+                });
+            }
         }
     }
 
@@ -1249,6 +1302,7 @@ fn generate_archive_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         sheets: Vec::new(),
         sections: Vec::new(),
         raw_text: None,
+        formatted_text: None,
         archive_entries: entries,
     }
 }
@@ -1293,27 +1347,165 @@ fn is_code_extension(ext: &str) -> bool {
     )
 }
 
-fn generate_text_thumbnail(filename: &str, data: &[u8]) -> PreviewThumbnail {
+fn text_kind(filename: &str, mime_type: &str, forced_kind: Option<PreviewKind>) -> PreviewKind {
+    if let Some(kind) = forced_kind {
+        return kind;
+    }
+
     let ext = filename
         .rsplit('.')
         .next()
         .unwrap_or("txt")
         .to_ascii_lowercase();
-    let kind = if is_code_extension(&ext) {
+    if matches!(ext.as_str(), "md" | "markdown")
+        || matches!(mime_type, "text/markdown" | "text/x-markdown")
+    {
+        PreviewKind::Markdown
+    } else if matches!(ext.as_str(), "html" | "htm" | "xhtml")
+        || mime_type.eq_ignore_ascii_case("text/html")
+        || mime_type.eq_ignore_ascii_case("application/xhtml+xml")
+    {
+        PreviewKind::Html
+    } else if is_code_extension(&ext) {
         PreviewKind::Code
     } else {
         PreviewKind::Text
-    };
+    }
+}
 
-    let raw = String::from_utf8_lossy(&data[..data.len().min(64_000)]).to_string();
-    let formatted = if ext == "json" {
-        serde_json::from_str::<serde_json::Value>(&raw)
+fn format_text_for_preview(filename: &str, mime_type: &str, source: &str) -> Option<String> {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "json" || mime_type == "application/json" {
+        serde_json::from_str::<serde_json::Value>(source)
             .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or(raw)
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+    } else if ext == "xml" || mime_type.ends_with("/xml") || mime_type.ends_with("+xml") {
+        format_xml(source)
+    } else if matches!(ext.as_str(), "yaml" | "yml")
+        || matches!(
+            mime_type,
+            "application/yaml" | "text/yaml" | "application/x-yaml"
+        )
+    {
+        format_yaml(source)
     } else {
-        raw
-    };
+        None
+    }
+}
+
+fn format_xml(source: &str) -> Option<String> {
+    let mut reader = Reader::from_str(source);
+    let mut events = Vec::new();
+    let mut stack: Vec<(usize, bool, bool)> = Vec::new();
+    let mut has_text_by_start = std::collections::HashMap::new();
+
+    loop {
+        let event = reader.read_event().ok()?;
+        if matches!(event, Event::Eof) {
+            break;
+        }
+
+        let event_index = events.len();
+        match &event {
+            Event::Start(start) => {
+                let parent_preserves_space = stack
+                    .last()
+                    .is_some_and(|(_, _, preserves_space)| *preserves_space);
+                let local_preserves_space = start
+                    .attributes()
+                    .flatten()
+                    .find(|attribute| attribute.key.local_name().as_ref() == b"space")
+                    .and_then(|attribute| attribute.unescape_value().ok())
+                    .map(|value| value == "preserve");
+                let preserves_space = local_preserves_space.unwrap_or(parent_preserves_space);
+                stack.push((event_index, preserves_space, preserves_space));
+            }
+            Event::Text(text) if !text.iter().all(u8::is_ascii_whitespace) => {
+                if let Some((_, has_text, _)) = stack.last_mut() {
+                    *has_text = true;
+                }
+            }
+            Event::CData(text) if !text.iter().all(u8::is_ascii_whitespace) => {
+                if let Some((_, has_text, _)) = stack.last_mut() {
+                    *has_text = true;
+                }
+            }
+            Event::End(_) => {
+                let (start_index, has_text, _) = stack.pop()?;
+                has_text_by_start.insert(start_index, has_text);
+            }
+            _ => {}
+        }
+        events.push(event.into_owned());
+    }
+
+    if !stack.is_empty() || events.is_empty() {
+        return None;
+    }
+
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut mixed_content_stack = Vec::new();
+    for (index, event) in events.into_iter().enumerate() {
+        match &event {
+            Event::Start(_) => {
+                mixed_content_stack.push(has_text_by_start.get(&index).copied().unwrap_or(false));
+                writer.write_event(event).ok()?;
+            }
+            Event::End(_) => {
+                writer.write_event(event).ok()?;
+                mixed_content_stack.pop()?;
+            }
+            Event::Text(text)
+                if text.iter().all(u8::is_ascii_whitespace)
+                    && !mixed_content_stack.last().copied().unwrap_or(false) => {}
+            _ => writer.write_event(event).ok()?,
+        }
+    }
+
+    let mut formatted = String::from_utf8(writer.into_inner()).ok()?;
+    if !formatted.is_empty() && !formatted.ends_with('\n') {
+        formatted.push('\n');
+    }
+    Some(formatted)
+}
+
+fn format_yaml(source: &str) -> Option<String> {
+    let documents = Yaml::load_from_str(source).ok()?;
+    if documents.is_empty() {
+        return None;
+    }
+
+    let mut formatted = String::new();
+    for (index, document) in documents.iter().enumerate() {
+        if index > 0 {
+            formatted.push_str("---\n");
+        }
+        YamlEmitter::new(&mut formatted).dump(document).ok()?;
+        if !formatted.ends_with('\n') {
+            formatted.push('\n');
+        }
+    }
+    Some(formatted)
+}
+
+fn generate_text_thumbnail(
+    filename: &str,
+    mime_type: &str,
+    data: &[u8],
+    forced_kind: Option<PreviewKind>,
+) -> PreviewThumbnail {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("txt")
+        .to_ascii_lowercase();
+    let kind = text_kind(filename, mime_type, forced_kind);
+    let raw = String::from_utf8_lossy(&data[..data.len().min(64_000)]).to_string();
+    let formatted = format_text_for_preview(filename, mime_type, &raw).unwrap_or(raw);
 
     let total_lines = formatted.lines().count() as u32;
     let snippet: String = formatted
@@ -1345,29 +1537,24 @@ fn generate_text_thumbnail(filename: &str, data: &[u8]) -> PreviewThumbnail {
     }
 }
 
-fn generate_text_preview(filename: &str, data: &[u8]) -> DocumentPreview {
+fn generate_text_preview(
+    filename: &str,
+    mime_type: &str,
+    data: &[u8],
+    forced_kind: Option<PreviewKind>,
+) -> DocumentPreview {
     let ext = filename
         .rsplit('.')
         .next()
         .unwrap_or("txt")
         .to_ascii_lowercase();
-    let kind = if is_code_extension(&ext) {
-        PreviewKind::Code
-    } else {
-        PreviewKind::Text
-    };
+    let kind = text_kind(filename, mime_type, forced_kind);
 
     let raw = String::from_utf8_lossy(&data[..data.len().min(512_000)]).to_string();
-    let formatted = if ext == "json" {
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or(raw)
-    } else {
-        raw
-    };
+    let formatted_text = format_text_for_preview(filename, mime_type, &raw);
+    let preview_text = formatted_text.as_deref().unwrap_or(&raw);
 
-    let total_lines = formatted.lines().count() as u32;
+    let total_lines = preview_text.lines().count() as u32;
 
     DocumentPreview {
         kind,
@@ -1377,7 +1564,8 @@ fn generate_text_preview(filename: &str, data: &[u8]) -> DocumentPreview {
         total_pages: 1,
         sheets: Vec::new(),
         sections: Vec::new(),
-        raw_text: Some(formatted),
+        raw_text: Some(raw),
+        formatted_text,
         archive_entries: Vec::new(),
     }
 }
